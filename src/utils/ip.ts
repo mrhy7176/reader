@@ -17,9 +17,12 @@ export function parseIp(ip: string): Buffer {
         if (ip.includes('.')) {
             const parts = ip.split(':');
             const ipv4Part = parts.pop();
-            if (!ipv4Part) throw new Error('Invalid IPv6 address');
+            if (!ipv4Part || !isIPv4(ipv4Part)) throw new Error('Invalid IPv6 address');
             const ipv4Bytes = parseIp(ipv4Part);
-            parts.push('0');
+            // The dotted tail occupies 32 bits (two hextets). A single placeholder
+            // shifts the preceding hextet (for example ffff in ::ffff:10.0.0.1)
+            // into the slot that the IPv4 write then overwrites.
+            parts.push('0', '0');
             const ipv6Bytes = parseIp(parts.join(':'));
             ipv6Bytes.writeUInt32BE(ipv4Bytes.readUInt32BE(0), 12);
 
@@ -155,12 +158,44 @@ const nonPublicNetworks6 = [
 
 const nonPublicCIDRs = [...nonPublicNetworks4, ...nonPublicNetworks6].map(cidr => new CIDR(cidr));
 
+// IPv4-mapped (::ffff:0:0/96) and IPv4-compatible (::/96) addresses carry an
+// IPv4 address in the last 32 bits. :: and ::1 stay native IPv6 addresses.
+function embeddedIPv4(buf: Buffer): Buffer | undefined {
+    if (buf.byteLength !== 16) {
+        return undefined;
+    }
+    for (let i = 0; i < 10; i++) {
+        if (buf[i] !== 0) {
+            return undefined;
+        }
+    }
+    if (buf[10] === 0xff && buf[11] === 0xff) {
+        return buf.subarray(12, 16);
+    }
+    if (buf[10] === 0 && buf[11] === 0) {
+        if (buf[12] === 0 && buf[13] === 0 && buf[14] === 0 && (buf[15] === 0 || buf[15] === 1)) {
+            return undefined;
+        }
+        return buf.subarray(12, 16);
+    }
+    return undefined;
+}
+
 export function isIPInNonPublicRange(ip: string) {
     const parsed = parseIp(ip);
 
     for (const cidr of nonPublicCIDRs) {
         if (cidr.test(parsed)) {
             return true;
+        }
+    }
+
+    const v4 = embeddedIPv4(parsed);
+    if (v4) {
+        for (const cidr of nonPublicCIDRs) {
+            if (cidr.family === 4 && cidr.test(v4)) {
+                return true;
+            }
         }
     }
 
